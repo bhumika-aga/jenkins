@@ -163,4 +163,114 @@ class PlainCLIProtocolTest {
         assertEquals(2, client.code);
     }
 
+    /**
+     * NOOP keep-alive frames (issue #26862) sent by either side must be transparently ignored and
+     * must not disturb the rest of the protocol (arguments, stdin, stdout, exit code).
+     */
+    @Test
+    void noopFramesAreIgnored() throws Exception {
+        final PipedOutputStream upload = new PipedOutputStream();
+        final PipedOutputStream download = new PipedOutputStream();
+        class Client extends PlainCLIProtocol.ClientSide {
+            int code = -1;
+            final ByteArrayOutputStream stdout = new ByteArrayOutputStream();
+
+            Client() {
+                super(new PlainCLIProtocol.FramedOutput(upload));
+            }
+
+            @Override
+            protected synchronized void onExit(int code) {
+                this.code = code;
+                notifyAll();
+            }
+
+            @Override
+            protected void onStdout(byte[] chunk) throws IOException {
+                stdout.write(chunk);
+            }
+
+            @Override
+            protected void onStderr(byte[] chunk) {}
+
+            @Override
+            protected void handleClose() {}
+        }
+
+        class Server extends PlainCLIProtocol.ServerSide {
+            String arg;
+            boolean started;
+            final ByteArrayOutputStream stdin = new ByteArrayOutputStream();
+
+            Server() throws IOException {
+                super(new PlainCLIProtocol.FramedOutput(download));
+            }
+
+            @Override
+            protected void onArg(String text) {
+                arg = text;
+            }
+
+            @Override
+            protected void onLocale(String text) {}
+
+            @Override
+            protected void onEncoding(String text) {}
+
+            @Override
+            protected synchronized void onStart() {
+                started = true;
+                notifyAll();
+            }
+
+            @Override
+            protected void onStdin(byte[] chunk) throws IOException {
+                stdin.write(chunk);
+            }
+
+            @Override
+            protected void onEndStdin() {}
+
+            @Override
+            protected void handleClose() {}
+        }
+
+        Client client = new Client();
+        Server server = new Server();
+        new PlainCLIProtocol.FramedReader(client, new PipedInputStream(download)).start();
+        new PlainCLIProtocol.FramedReader(server, new PipedInputStream(upload)).start();
+
+        // Client -> server, with NOOP keep-alives interleaved with real frames.
+        client.sendNoop();
+        client.sendArg("command");
+        client.sendStart();
+        client.sendNoop();
+        client.streamStdin().write("hello".getBytes(Charset.defaultCharset()));
+        client.sendNoop();
+        synchronized (server) {
+            while (!server.started) {
+                server.wait();
+            }
+        }
+
+        // Server -> client, with NOOP keep-alives interleaved with real frames.
+        server.sendNoop();
+        server.streamStdout().write("goodbye".getBytes(Charset.defaultCharset()));
+        server.sendNoop();
+        server.sendExit(2);
+        synchronized (client) {
+            while (client.code == -1) {
+                client.wait();
+            }
+        }
+        while (server.stdin.size() == 0) {
+            Thread.sleep(100);
+        }
+
+        assertEquals("hello", server.stdin.toString(Charset.defaultCharset()));
+        assertEquals("command", server.arg);
+        assertEquals("goodbye", client.stdout.toString(Charset.defaultCharset()));
+        assertEquals(2, client.code);
+    }
+
 }

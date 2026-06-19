@@ -70,7 +70,13 @@ class PlainCLIProtocol {
         /** Chunk of stdout. */
         STDOUT(false),
         /** Chunk of stderr. */
-        STDERR(false);
+        STDERR(false),
+        /**
+         * No-op keep-alive frame. May be sent by either side to keep an otherwise idle connection
+         * from being closed by intermediaries such as reverse proxies. Carries no data and is
+         * ignored on receipt. Must remain the last constant so existing opcode ordinals are stable.
+         */
+        NOOP(false);
         /** True if sent from the client to the server; false if sent from the server to the client. */
         final boolean clientSide;
 
@@ -193,15 +199,32 @@ class PlainCLIProtocol {
             }
             Op op = Op.values()[b];
             LOGGER.finest(() -> "handling frame with " + op);
+            if (op == Op.NOOP) {
+                onNoop(); // keep-alive frame; no data to process
+                return;
+            }
             if (!handle(op, dis)) {
                 throw new ProtocolException("unhandled: " + op);
             }
         }
 
+        /**
+         * Called when a {@link Op#NOOP} keep-alive frame is received. Does nothing by default.
+         */
+        protected void onNoop() {}
+
         protected abstract boolean handle(Op op, DataInputStream dis) throws IOException;
 
         protected final synchronized void send(Op op) throws IOException {
             send(op, new byte[0], 0, 0);
+        }
+
+        /**
+         * Sends a no-op keep-alive frame to the other side, to prevent an idle connection from
+         * being closed by intermediaries such as reverse proxies. Safe to call from any thread.
+         */
+        public final void sendNoop() throws IOException {
+            send(Op.NOOP);
         }
 
         protected final synchronized void send(Op op, int v) throws IOException {

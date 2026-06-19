@@ -82,6 +82,14 @@ public class CLIAction implements UnprotectedRootAction, StaplerProxy {
     /* package-private for testing */ static /* non-final for Script Console */ Boolean ALLOW_WEBSOCKET = SystemProperties.optBoolean(CLIAction.class.getName() + ".ALLOW_WEBSOCKET");
 
     /**
+     * Interval in milliseconds at which the server sends keep-alive frames to the client while a
+     * command is running, to prevent intermediaries such as reverse proxies from closing an
+     * otherwise idle connection and aborting a long-running command (issue #26862). Mirrors the
+     * client-side ping in {@code hudson.cli.CLI}.
+     */
+    /* package-private for testing */ static /* non-final for Script Console */ int KEEP_ALIVE_INTERVAL = Integer.getInteger(CLIAction.class.getName() + ".keepAliveInterval", 3000);
+
+    /**
      * If this is set to {@code true}, {@link Jenkins#getRootUrlFromRequest()} is used to validate the {@code Origin} header.
      * This can be a security issue if Jenkins is running on a local network without authentication as it allows DNS rebinding attacks.
      */
@@ -355,9 +363,32 @@ public class CLIAction implements UnprotectedRootAction, StaplerProxy {
             command.setTransportAuth2(authentication);
             command.setClientCharset(encoding);
             CLICommand orig = CLICommand.setCurrent(command);
+            // Keep the (otherwise idle) download connection alive while the command runs, so that
+            // intermediaries such as reverse proxies do not close it and abort the command. The
+            // client keeps the upload connection alive with its own ping. See issue #26862.
+            Thread keepAlive = new Thread("CLI keep-alive: " + commandName) {
+                @Override
+                public void run() {
+                    try {
+                        Thread.sleep(KEEP_ALIVE_INTERVAL);
+                        while (true) {
+                            LOGGER.fine("sending keep-alive");
+                            sendNoop();
+                            Thread.sleep(KEEP_ALIVE_INTERVAL);
+                        }
+                    } catch (InterruptedException x) {
+                        // command finished; stop sending keep-alives
+                    } catch (IOException x) {
+                        LOGGER.log(Level.FINE, "failed to send CLI keep-alive", x);
+                    }
+                }
+            };
+            keepAlive.setDaemon(true);
             try {
                 runningThread = Thread.currentThread();
+                keepAlive.start();
                 int exit = command.main(args.subList(1, args.size()), locale, stdin, stdout, stderr);
+                keepAlive.interrupt();
                 stdout.flush();
                 sendExit(exit);
                 try { // seems to avoid ReadPendingException from Jetty
@@ -366,6 +397,7 @@ public class CLIAction implements UnprotectedRootAction, StaplerProxy {
                     // expected; ignore
                 }
             } finally {
+                keepAlive.interrupt();
                 CLICommand.setCurrent(orig);
                 runningThread = null;
             }
